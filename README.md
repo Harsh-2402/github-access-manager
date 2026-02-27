@@ -50,8 +50,8 @@
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/GitAccessControl.git
-cd GitAccessControl
+git clone https://github.com/Harsh-2402/github-access-manager.git
+cd github-access-manager  
 ```
 
 ### 2. Backend Setup
@@ -286,5 +286,5 @@ This project is licensed under the [MIT License](LICENSE).
 ---
 
 <div align="center">
-Made with ❤️ | <a href="https://github.com/YOUR_USERNAME/GitAccessControl">GitHub</a>
+Made with ❤️ | <a href="https://github.com/Harsh-2402/github-access-manager">GitHub</a>
 </div>
