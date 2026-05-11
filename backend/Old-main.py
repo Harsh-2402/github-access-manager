@@ -3,13 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import github_service
 import logging
 import json
 import requests
-
-MAX_PARALLEL_REPOS = 10
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,85 +38,6 @@ class RemoveAccessRequest(BaseModel):
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "Service is healthy"}
-
-
-# ── Per-repo worker (runs in thread pool) ─────────────────────────────────────
-def _scan_repo(repo: dict, login: str) -> dict:
-    """
-    Check a single repo for the given login.
-
-    Returns:
-      { "full_name": str, "match": <repo-payload> | None }
-
-    IMPORTANT: /collaborators/{login}/permission returns 200 for ANY user with
-    repo access (including org members), not just direct collaborators. So we
-    first verify direct membership with a check call: 204 = direct collaborator,
-    404 = not.
-    """
-    owner     = repo["owner"]["login"]
-    repo_name = repo["name"]
-    full_name = repo["full_name"]
-
-    logger.info(f"[scan] → {full_name} (user={login})")
-
-    # ── 3a: Direct collaborator check ─────────────────────────────────────────
-    try:
-        collab_url = f"{github_service.GITHUB_API_URL}/repos/{owner}/{repo_name}/collaborators/{login}"
-        check_resp = requests.get(collab_url, headers=github_service.get_headers())
-        logger.info(f"[scan] {full_name} collaborator-check → {check_resp.status_code}")
-
-        if check_resp.status_code == 204:
-            perm_url  = f"{collab_url}/permission"
-            perm_resp = requests.get(perm_url, headers=github_service.get_headers())
-            logger.info(f"[scan] {full_name} permission-check → {perm_resp.status_code}")
-
-            perm = "read"
-            if perm_resp.status_code == 200:
-                perm = perm_resp.json().get("permission", "read")
-
-            if perm != "none":
-                logger.info(f"[scan] ✓ MATCH {full_name} status=active perm={perm}")
-                return {
-                    "full_name": full_name,
-                    "match": {
-                        "owner":         owner,
-                        "repo":          repo_name,
-                        "full_name":     full_name,
-                        "permission":    perm,
-                        "status":        "active",
-                        "username":      login,
-                        "invitation_id": None,
-                    },
-                }
-    except Exception as e:
-        logger.warning(f"[scan] {full_name} collaborator check error: {e}")
-
-    # ── 3b: Pending invitation check ──────────────────────────────────────────
-    try:
-        invitations = github_service.get_repo_invitations(owner, repo_name)
-        logger.info(f"[scan] {full_name} invitations-check → {len(invitations)} pending")
-
-        for invite in invitations:
-            invitee = invite.get("invitee") or {}
-            if invitee.get("login", "").lower() == login.lower():
-                logger.info(f"[scan] ✓ MATCH {full_name} status=invited id={invite.get('id')}")
-                return {
-                    "full_name": full_name,
-                    "match": {
-                        "owner":         owner,
-                        "repo":          repo_name,
-                        "full_name":     full_name,
-                        "permission":    invite.get("permissions", "read"),
-                        "status":        "invited",
-                        "username":      login,
-                        "invitation_id": invite.get("id"),
-                    },
-                }
-    except Exception as e:
-        logger.warning(f"[scan] {full_name} invitation check error: {e}")
-
-    logger.info(f"[scan] ✗ no access in {full_name}")
-    return {"full_name": full_name, "match": None}
 
 
 # ── STEP 2–4: Scan a username across all repos (SSE stream) ───────────────────
@@ -191,41 +109,88 @@ def stream_user_access(username: str):
         yield sse({"type": "start", "total": total_repos, "username": login, "avatar_url": avatar_url, "is_owner": is_owner})
 
 
-        # ── STEP 3: Scan repos in parallel (10 at a time) ──────────────────────
-        logger.info(f"[stream] starting parallel scan: {total_repos} repos, {MAX_PARALLEL_REPOS} workers, user={login}")
+        # ── STEP 3: Scan each repo ─────────────────────────────────────────────
+        for repo in all_repos:
+            owner     = repo["owner"]["login"]
+            repo_name = repo["name"]
+            full_name = repo["full_name"]
+            scanned_count += 1
 
-        # NOTE: do NOT use `with ThreadPoolExecutor(...)` inside a generator.
-        # If the client disconnects mid-stream, the generator is closed and the
-        # `with` block calls shutdown(wait=True) during teardown — which may
-        # try to join the very thread running cleanup → "cannot join current
-        # thread". Manage the executor manually instead.
-        executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_REPOS)
-        try:
-            futures = [executor.submit(_scan_repo, repo, login) for repo in all_repos]
+            # Emit progress
+            yield sse({
+                "type":    "scanning",
+                "repo":    full_name,
+                "scanned": scanned_count,
+                "total":   total_repos,
+            })
 
-            for future in as_completed(futures):
-                result = future.result()
-                scanned_count += 1
+            access_found = False
 
-                logger.info(f"[stream] progress {scanned_count}/{total_repos} → {result['full_name']}")
+            # ── 3a: Check Direct Collaborators ───────────────────────────────
+            #
+            # IMPORTANT: /collaborators/{login}/permission returns 200 for ANY
+            # user with repo access (including org members), not just direct
+            # collaborators. So we first verify direct membership with a HEAD
+            # check: 204 = is a direct collaborator, 404 = is not.
+            try:
+                check_resp = requests.get(
+                    f"{github_service.GITHUB_API_URL}/repos/{owner}/{repo_name}/collaborators/{login}",
+                    headers=github_service.get_headers(),
+                )
+                if check_resp.status_code == 204:
+                    # Confirmed direct collaborator — now get their permission level
+                    perm_resp = requests.get(
+                        f"{github_service.GITHUB_API_URL}/repos/{owner}/{repo_name}/collaborators/{login}/permission",
+                        headers=github_service.get_headers(),
+                    )
+                    perm = "read"
+                    if perm_resp.status_code == 200:
+                        perm = perm_resp.json().get("permission", "read")
 
-                # Emit progress
-                yield sse({
-                    "type":    "scanning",
-                    "repo":    result["full_name"],
-                    "scanned": scanned_count,
-                    "total":   total_repos,
-                })
+                    if perm != "none":
+                        yield sse({
+                            "type": "found",
+                            "repo": {
+                                "owner":         owner,
+                                "repo":          repo_name,
+                                "full_name":     full_name,
+                                "permission":    perm,
+                                "status":        "active",
+                                "username":      login,
+                                "invitation_id": None,
+                            },
+                        })
+                        found_count  += 1
+                        access_found  = True
+                # 404 = not a direct collaborator → fall through to invite check
+            except Exception as e:
+                logger.debug(f"Collaborator check error for {full_name}: {e}")
 
-                if result["match"] is not None:
-                    yield sse({"type": "found", "repo": result["match"]})
-                    found_count += 1
-        finally:
-            # wait=False + cancel_futures=True → don't block on workers on
-            # client-disconnect / GeneratorExit
-            executor.shutdown(wait=False, cancel_futures=True)
 
-        logger.info(f"[stream] done: scanned={scanned_count}/{total_repos} found={found_count} user={login}")
+            # ── 3b: Check Pending Invitations (if not already found) ──────────
+            if not access_found:
+                try:
+                    invitations = github_service.get_repo_invitations(owner, repo_name)
+                    for invite in invitations:
+                        invitee = invite.get("invitee") or {}
+                        if invitee.get("login", "").lower() == login.lower():
+                            yield sse({
+                                "type": "found",
+                                "repo": {
+                                    "owner":         owner,
+                                    "repo":          repo_name,
+                                    "full_name":     full_name,
+                                    "permission":    invite.get("permissions", "read"),
+                                    "status":        "invited",
+                                    "username":      login,
+                                    "invitation_id": invite.get("id"),
+                                },
+                            })
+                            found_count  += 1
+                            break
+                except Exception as e:
+                    logger.debug(f"Invitation check error for {full_name}: {e}")
+
         yield sse({"type": "done", "total": found_count})
 
     return StreamingResponse(
